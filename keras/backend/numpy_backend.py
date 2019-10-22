@@ -6,7 +6,7 @@ from __future__ import print_function
 import numpy as np
 import scipy.signal as signal
 import scipy as sp
-from keras.backend import floatx
+from .common import floatx
 from keras.utils.generic_utils import transpose_shape
 from keras.utils import to_categorical
 
@@ -185,43 +185,52 @@ def bias_add(x, y, data_format):
     return x + y
 
 
-def rnn(x, w, init, go_backwards=False, mask=None, unroll=False, input_length=None):
-    w_i, w_h, w_o = w
-    h = []
-    o = []
+def rnn(step_function, inputs, initial_states,
+        go_backwards=False, mask=None, constants=None,
+        unroll=False, input_length=None):
 
-    if go_backwards:
-        t_list = range(x.shape[1] - 1, -1, -1)
-    else:
-        t_list = range(x.shape[1])
+    if constants is None:
+        constants = []
 
+    output_sample, _ = step_function(inputs[:, 0], initial_states + constants)
     if mask is not None:
-        from keras import backend as K
-        np_mask = K.eval(mask)
-    else:
-        np_mask = None
+        if mask.dtype != np.bool:
+            mask = mask.astype(np.bool)
+        if mask.shape != inputs.shape[:2]:
+            raise ValueError(
+                'mask should have `shape=(samples, time)`, '
+                'got {}'.format(mask.shape))
 
-    for (i, t) in enumerate(t_list):
-        h_t = np.dot(x[:, t], w_i)
+        def expand_mask(mask_, x):
+            # expand mask so that `mask[:, t].ndim == x.ndim`
+            while mask_.ndim < x.ndim + 1:
+                mask_ = np.expand_dims(mask_, axis=-1)
+            return mask_
+        output_mask = expand_mask(mask, output_sample)
+        states_masks = [expand_mask(mask, state) for state in initial_states]
 
-        if w_h is not None:
-            prev = h[i - 1] if i > 0 else init
-            h_t1 = np.dot(prev, w_h)
-            if np_mask is not None:
-                h_t1[np_mask[:, t] == 0] = prev[np_mask[:, t] == 0]
-        else:
-            h_t1 = 0
+    if input_length is None:
+        input_length = inputs.shape[1]
+    assert input_length == inputs.shape[1]
+    time_index = range(input_length)
+    if go_backwards:
+        time_index = time_index[::-1]
 
-        o_t = h_t + h_t1
-        if w_o is not None:
-            o_t = np.dot(o_t, w_o)
-        o.append(o_t)
+    outputs = []
+    states_tm1 = initial_states  # tm1 means "t minus one" as in "previous timestep"
+    output_tm1 = np.zeros(output_sample.shape)
+    for t in time_index:
+        output_t, states_t = step_function(inputs[:, t], states_tm1 + constants)
+        if mask is not None:
+            output_t = np.where(output_mask[:, t], output_t, output_tm1)
+            states_t = [np.where(state_mask[:, t], state_t, state_tm1)
+                        for state_mask, state_t, state_tm1
+                        in zip(states_masks, states_t, states_tm1)]
+        outputs.append(output_t)
+        states_tm1 = states_t
+        output_tm1 = output_t
 
-        if np_mask is not None:
-            h_t = h_t * np_mask[:, t].reshape(-1, 1)
-        h.append(h_t + h_t1)
-
-    return o[-1], np.stack(o, axis=1), np.stack(h, axis=1)
+    return outputs[-1], np.stack(outputs, axis=1), states_tm1
 
 
 _LEARNING_PHASE = True
@@ -268,12 +277,16 @@ def relu(x, alpha=0., max_value=None, threshold=0.):
 def switch(condition, then_expression, else_expression):
     cond_float = condition.astype(floatx())
     while cond_float.ndim < then_expression.ndim:
-        cond_float = cond_float[..., None]
+        cond_float = cond_float[..., np.newaxis]
     return cond_float * then_expression + (1 - cond_float) * else_expression
 
 
 def softplus(x):
     return np.log(1. + np.exp(x))
+
+
+def softsign(x):
+    return x / (1 + np.abs(x))
 
 
 def elu(x, alpha=1.):
@@ -301,6 +314,12 @@ def softmax(x, axis=-1):
 def l2_normalize(x, axis=-1):
     y = np.max(np.sum(x ** 2, axis, keepdims=True), axis, keepdims=True)
     return x / np.sqrt(y)
+
+
+def in_top_k(predictions, targets, k):
+    top_k = np.argsort(-predictions)[:, :k]
+    targets = targets.reshape(-1, 1)
+    return np.any(targets == top_k, axis=-1)
 
 
 def binary_crossentropy(target, output, from_logits=False):
@@ -353,7 +372,7 @@ def std(x, axis=None, keepdims=False):
 def logsumexp(x, axis=None, keepdims=False):
     if isinstance(axis, list):
         axis = tuple(axis)
-    return sp.misc.logsumexp(x, axis=axis, keepdims=keepdims)
+    return sp.special.logsumexp(x, axis=axis, keepdims=keepdims)
 
 
 def sum(x, axis=None, keepdims=False):
@@ -509,6 +528,10 @@ def print_tensor(x, message=''):
     return x
 
 
+def batch_normalization(x, mean, var, beta, gamma, axis=-1, epsilon=0.001):
+    return ((x - mean) / sqrt(var + epsilon)) * gamma + beta
+
+
 def dot(x, y):
     return np.dot(x, y)
 
@@ -574,6 +597,14 @@ def reverse(x, axes):
     if isinstance(axes, list):
         axes = tuple(axes)
     return np.flip(x, axes)
+
+
+py_slice = slice
+
+
+def slice(x, start, size):
+    slices = [py_slice(i, i + j) for i, j in zip(start, size)]
+    return x[tuple(slices)]
 
 
 def variable(value, dtype=None, name=None, constraint=None):
@@ -657,7 +688,11 @@ def ones_like(x, dtype=floatx(), name=None):
 
 
 def eye(size, dtype=None, name=None):
-    return np.eye(size, dtype=dtype)
+    if isinstance(size, (list, tuple)):
+        n, m = size
+    else:
+        n, m = size, size
+    return np.eye(n, m, dtype=dtype)
 
 
 def resize_images(x, height_factor, width_factor, data_format):
@@ -686,7 +721,8 @@ def one_hot(indices, num_classes):
     return to_categorical(indices, num_classes)
 
 
-def ctc_decode(y_pred, input_length, greedy=True, beam_width=100, top_paths=1):
+def ctc_decode(y_pred, input_length, greedy=True, beam_width=100, top_paths=1,
+               merge_repeated=False):
     num_samples = y_pred.shape[0]
     num_classes = y_pred.shape[-1]
     log_prob = np.zeros((num_samples, 1))
@@ -704,7 +740,7 @@ def ctc_decode(y_pred, input_length, greedy=True, beam_width=100, top_paths=1):
             decoded_dense[i, :len(decoded)] = decoded
         return decoded_dense[:, :np.max(decoded_length)], log_prob
     else:
-        raise "not supported yet"
+        raise NotImplementedError
 
 
 def _remove_repeats(inds):
@@ -714,6 +750,10 @@ def _remove_repeats(inds):
 
 def _remove_blanks(inds, num_classes):
     return inds[inds < (num_classes - 1)]
+
+
+def stack(x, axis=0):
+    return np.stack(x, axis=axis)
 
 
 square = np.square
